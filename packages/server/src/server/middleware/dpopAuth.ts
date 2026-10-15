@@ -36,12 +36,19 @@ export interface DpopAuthOptions extends VerifyBearerTokenOptions {
 
     /**
      * Server-provided nonce support (RFC 9449 §9 — a SHOULD, not a MUST). Omit to never require
-     * a nonce. When set, {@linkcode dpopAuthChallengeResponse} calls `issue()` to mint the nonce
-     * returned in a `use_dpop_nonce` challenge's `DPoP-Nonce` header, and {@linkcode verifyDpopToken}
-     * calls `verify()` (via {@linkcode DpopNonceState}) to check a presented proof's nonce.
+     * a nonce. When set, {@linkcode dpopAuthChallengeResponse} calls `issue()` for the `DPoP-Nonce`
+     * header on every `401` (so a client's first, token-less request already learns the nonce), and
+     * {@linkcode verifyDpopToken} calls `verify()` (via {@linkcode DpopNonceState}) to check a
+     * presented proof's nonce. RFC 9449 §8.2 lets a fresh nonce ride on success responses too; the
+     * Express middleware sets it there itself, a `fetch` host sets `DPoP-Nonce: nonce.issue()` on its
+     * own response. When to rotate is the host's policy, expressed through what `issue()` returns.
      */
     nonce?: {
-        /** Mint the nonce to include in the next `use_dpop_nonce` challenge. */
+        /**
+         * The nonce to send in a `DPoP-Nonce` response header: the one the next proof should carry.
+         * Called on every `401`, so also for unauthenticated requests; return the current value and
+         * keep no per-call state, or an anonymous caller can make the server mint nonces at will.
+         */
         issue(): string;
     } & DpopNonceState;
 
@@ -154,9 +161,10 @@ export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOpt
  * Maps an {@linkcode OAuthError} to its status — `401` for `invalid_token`/`invalid_dpop_proof`
  * and `use_dpop_nonce` (all carrying a `WWW-Authenticate: DPoP …` challenge advertising the
  * accepted `algs`, plus `resource_metadata` when configured), `403` for `insufficient_scope`,
- * `500` for `server_error`, `400` for anything else. `use_dpop_nonce` additionally carries a fresh
- * `DPoP-Nonce` response header (from `options.nonce.issue()`) for the client to retry with — see
- * RFC 9449 §9. A non-`OAuthError` value answers `500 server_error`. The body is the OAuth error JSON.
+ * `500` for `server_error`, `400` for anything else. When `options.nonce` is set, every `401` also
+ * carries a `DPoP-Nonce` response header (from `options.nonce.issue()`) for the client's next proof
+ * — see RFC 9449 §8.2 / §9. A non-`OAuthError` value answers `500 server_error`. The body is the
+ * OAuth error JSON.
  */
 export function dpopAuthChallengeResponse(
     error: unknown,
@@ -174,10 +182,9 @@ export function dpopAuthChallengeResponse(
 
     switch (error.code) {
         case OAuthErrorCode.InvalidToken:
-        case OAuthErrorCode.InvalidDpopProof: {
-            return Response.json(error.toResponseObject(), { status: 401, headers: { 'WWW-Authenticate': challenge() } });
-        }
+        case OAuthErrorCode.InvalidDpopProof:
         case OAuthErrorCode.UseDpopNonce: {
+            // Every 401 carries the nonce, not only use_dpop_nonce: the first request has no proof yet to carry one.
             const headers: Record<string, string> = { 'WWW-Authenticate': challenge() };
             if (nonce) headers['DPoP-Nonce'] = nonce.issue();
             return Response.json(error.toResponseObject(), { status: 401, headers });

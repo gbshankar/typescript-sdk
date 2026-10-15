@@ -422,6 +422,29 @@ describe('dpopAuthChallengeResponse', () => {
         expect(response.headers.get('DPoP-Nonce')).toBeNull();
     });
 
+    it('sets DPoP-Nonce on every 401 when a nonce option is configured, so the first request learns it', async () => {
+        const nonce = { issue: () => 'nonce-1', verify: () => false };
+        for (const error of [
+            new OAuthError(OAuthErrorCode.InvalidToken, 'Missing Authorization header'),
+            new OAuthError(OAuthErrorCode.InvalidDpopProof, 'missing DPoP proof header')
+        ]) {
+            const response = dpopAuthChallengeResponse(error, { nonce });
+            expect(response.status).toBe(401);
+            expect(response.headers.get('DPoP-Nonce')).toBe('nonce-1');
+        }
+    });
+
+    it('does not set DPoP-Nonce on 403, 500 or 400 answers', async () => {
+        const nonce = { issue: () => 'nonce-1', verify: () => false };
+        for (const error of [
+            new OAuthError(OAuthErrorCode.InsufficientScope, 'Insufficient scope'),
+            new OAuthError(OAuthErrorCode.ServerError, 'boom'),
+            new OAuthError(OAuthErrorCode.InvalidRequest, 'nope')
+        ]) {
+            expect(dpopAuthChallengeResponse(error, { nonce }).headers.get('DPoP-Nonce')).toBeNull();
+        }
+    });
+
     it('answers 403 for insufficient_scope', async () => {
         const response = dpopAuthChallengeResponse(new OAuthError(OAuthErrorCode.InsufficientScope, 'Insufficient scope'), {
             requiredScopes: ['admin']
@@ -459,6 +482,13 @@ describe('requireDpopAuth (web-standard)', () => {
         const proof = await buildProof(signer, 'POST', url, token);
         const result = await gate(new Request(url, { method: 'POST', headers: { Authorization: `DPoP ${token}`, DPoP: proof } }));
         expect(result).toMatchObject({ token });
+    });
+
+    it('answers a token-less first request with 401 and the DPoP-Nonce to use', async () => {
+        const gate = requireDpopAuth({ verifier: verifierFor({}), nonce: { issue: () => 'nonce-1', verify: n => n === 'nonce-1' } });
+        const result = (await gate(new Request(url, { method: 'POST' }))) as Response;
+        expect(result.status).toBe(401);
+        expect(result.headers.get('DPoP-Nonce')).toBe('nonce-1');
     });
 
     it('resolves to the 401 challenge Response for a missing proof', async () => {

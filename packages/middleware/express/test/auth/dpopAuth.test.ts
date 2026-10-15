@@ -97,6 +97,7 @@ describe('requireDpopAuth middleware (mocked req/res)', () => {
         expect(req.auth).toEqual(authInfo);
         expect(next).toHaveBeenCalled();
         expect(res.status).not.toHaveBeenCalled();
+        expect(res.set).not.toHaveBeenCalled();
     });
 
     it('responds 401 with a DPoP WWW-Authenticate challenge when the proof header is missing', async () => {
@@ -183,6 +184,33 @@ describe('requireDpopAuth middleware (mocked req/res)', () => {
         expect(second.res.status).toHaveBeenCalledWith(401);
         expect(second.res.json).toHaveBeenCalledWith(expect.objectContaining({ error: 'invalid_dpop_proof' }));
         expect(second.next).not.toHaveBeenCalled();
+    });
+
+    it('sets DPoP-Nonce on an accepted request when a nonce option is configured', async () => {
+        mockVerifyAccessToken.mockResolvedValue({
+            token: boundToken,
+            clientId: 'client-123',
+            scopes: [],
+            expiresAt: Math.floor(Date.now() / 1000) + 3600,
+            cnf: { jkt: signer.jkt }
+        });
+        const proof = await buildProof(signer, 'POST', 'https://mcp.example.com/mcp', boundToken);
+        const { req, res, next } = createMockReqResNext(`DPoP ${boundToken}`, proof);
+        const middleware = requireDpopAuth({ verifier: mockVerifier, nonce: { issue: () => 'nonce-2', verify: () => true } });
+        await middleware(req, res, next);
+
+        expect(res.set).toHaveBeenCalledWith('DPoP-Nonce', 'nonce-2');
+        expect(next).toHaveBeenCalled();
+    });
+
+    it('sets DPoP-Nonce on a 401 for a request without a proof when a nonce option is configured', async () => {
+        const { req, res, next } = createMockReqResNext(undefined, undefined);
+        const middleware = requireDpopAuth({ verifier: mockVerifier, nonce: { issue: () => 'nonce-3', verify: () => true } });
+        await middleware(req, res, next);
+
+        expect(res.status).toHaveBeenCalledWith(401);
+        expect(res.set).toHaveBeenCalledWith('DPoP-Nonce', 'nonce-3');
+        expect(next).not.toHaveBeenCalled();
     });
 
     it('responds 403 with scope in WWW-Authenticate when required scopes are missing', async () => {

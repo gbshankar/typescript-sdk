@@ -36,8 +36,9 @@ function reconstructRequestUrl(req: Request): string {
  * attaches it.
  *
  * On failure the middleware sends a JSON OAuth error body and a `WWW-Authenticate: DPoP …`
- * challenge (plus a `DPoP-Nonce` header when `options.nonce` issues one) — see
- * {@link dpopAuthChallengeResponse} in `@modelcontextprotocol/server`.
+ * challenge — see {@link dpopAuthChallengeResponse} in `@modelcontextprotocol/server`. When
+ * `options.nonce` is set, every `401` and every accepted request carries a `DPoP-Nonce` header
+ * from `nonce.issue()` (RFC 9449 §8.2).
  */
 export function requireDpopAuth(options: DpopAuthMiddlewareOptions): RequestHandler {
     // Destructure at creation so a plain-JS caller passing undefined or malformed options crashes
@@ -55,6 +56,7 @@ export function requireDpopAuth(options: DpopAuthMiddlewareOptions): RequestHand
                 },
                 resolved
             );
+            if (nonce) res.set('DPoP-Nonce', nonce.issue());
             next();
         } catch (error) {
             // The core Response supplies status and challenge headers; the body is derived
