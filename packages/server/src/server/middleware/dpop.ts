@@ -218,9 +218,11 @@ function normalizeHtu(raw: string): string {
 export interface DpopNonceState {
     /**
      * Whether `nonce` (the proof's `nonce` claim, or `undefined` if it carried none) is currently
-     * acceptable. Return `true` unconditionally to never require a nonce.
+     * acceptable. Return `true` unconditionally to never require a nonce. Return a `boolean`, or a
+     * `Promise<boolean>` for a store shared between server instances; {@linkcode verifyDpopProof}
+     * always `await`s the result, so both forms behave the same.
      */
-    verify(nonce: string | undefined): boolean;
+    verify(nonce: string | undefined): boolean | Promise<boolean>;
 }
 
 export interface VerifyDpopProofOptions {
@@ -344,7 +346,7 @@ export async function verifyDpopProof(options: VerifyDpopProofOptions): Promise<
         }
     }
 
-    if (nonce && !nonce.verify(typeof payload.nonce === 'string' ? payload.nonce : undefined)) {
+    if (nonce && !(await nonce.verify(typeof payload.nonce === 'string' ? payload.nonce : undefined))) {
         throw new OAuthError(OAuthErrorCode.UseDpopNonce, 'a fresh server-provided nonce is required');
     }
 

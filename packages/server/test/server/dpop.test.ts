@@ -416,5 +416,13 @@ describe('verifyDpopProof', () => {
             const result = await verifyDpopProof({ proof, method: 'POST', url, nonce });
             expect(result.claims.nonce).toBe('expected-nonce');
         });
+
+        it('awaits an async verify', async () => {
+            const nonce = { verify: async (n: string | undefined) => n === 'expected-nonce' };
+            const right = await buildProof({ kp, htm: 'POST', htu: url, nonce: 'expected-nonce' });
+            await expect(verifyDpopProof({ proof: right, method: 'POST', url, nonce })).resolves.toBeDefined();
+            const wrong = await buildProof({ kp, htm: 'POST', htu: url, nonce: 'not-it' });
+            await expect(verifyDpopProof({ proof: wrong, method: 'POST', url, nonce })).rejects.toMatchObject({ code: 'use_dpop_nonce' });
+        });
     });
 });
