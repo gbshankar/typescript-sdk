@@ -317,6 +317,39 @@ describe('verifyDpopToken jti replay protection', () => {
     });
 });
 
+describe('verifyDpopToken resourceMetadataUrl hand-off', () => {
+    const resourceMetadataUrl = 'https://api.example.com/.well-known/oauth-protected-resource';
+    const token = 'bound-token';
+
+    async function verifyWith(authInfoExtra: Partial<AuthInfo>): Promise<AuthInfo> {
+        const signer = await generateSigner();
+        const proof = await buildProof(signer, 'POST', url, token);
+        const options: DpopAuthOptions = {
+            verifier: verifierFor({
+                [token]: {
+                    token,
+                    clientId: 'client-1',
+                    scopes: ['mcp'],
+                    expiresAt: Math.floor(Date.now() / 1000) + 3600,
+                    cnf: { jkt: signer.jkt },
+                    ...authInfoExtra
+                }
+            }),
+            resourceMetadataUrl
+        };
+        return verifyDpopToken({ authorization: `DPoP ${token}`, dpop: proof, method: 'POST', url }, options);
+    }
+
+    it('stamps the configured resourceMetadataUrl onto the returned AuthInfo, as verifyBearerToken does', async () => {
+        await expect(verifyWith({})).resolves.toMatchObject({ token, resourceMetadataUrl });
+    });
+
+    it('keeps a verifier-set resourceMetadataUrl', async () => {
+        const verifierSet = 'https://verifier.example.com/.well-known/oauth-protected-resource';
+        await expect(verifyWith({ resourceMetadataUrl: verifierSet })).resolves.toMatchObject({ resourceMetadataUrl: verifierSet });
+    });
+});
+
 describe('verifyDpopToken with a JWT-shaped access token', () => {
     // The tests above all use short opaque strings as the access token, matching an
     // introspection-backed OAuthTokenVerifier. This proves the same flow when the access token is

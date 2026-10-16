@@ -96,7 +96,8 @@ export interface DpopRequest {
  * step 12b — the actual sender-constraint check; everything upstream of it only confirms the
  * caller holds *some* valid token and *some* well-formed proof, not that they're bound together).
  * Then enforces `expectedResource`, `requiredScopes`, and token expiry exactly as `verifyBearerToken` does,
- * and consumes the proof's `jti` through `options.replay` when set.
+ * consumes the proof's `jti` through `options.replay` when set, and stamps `resourceMetadataUrl` onto
+ * the returned {@linkcode AuthInfo} as `verifyBearerToken` does.
  *
  * On any failure throws an {@linkcode OAuthError} — pass that to
  * {@linkcode dpopAuthChallengeResponse} for the matching HTTP answer, or use
@@ -150,6 +151,11 @@ export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOpt
     // Last, so a refused request never consumes its jti. TTL = the iat window (2 * skew), whole seconds, at least 1.
     if (replay && !(await replay.consume(`${jkt}.${claims.jti}`, Math.max(1, Math.ceil(2 * iatSkewSeconds))))) {
         throw new OAuthError(OAuthErrorCode.InvalidDpopProof, "DPoP proof 'jti' has already been used");
+    }
+
+    // Same hand-off as verifyBearerToken: a verifier-set value wins over the gate's configuration.
+    if (options.resourceMetadataUrl !== undefined && authInfo.resourceMetadataUrl === undefined) {
+        return { ...authInfo, resourceMetadataUrl: options.resourceMetadataUrl };
     }
 
     return authInfo;
