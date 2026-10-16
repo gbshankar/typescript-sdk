@@ -161,6 +161,30 @@ describe('requireDpopAuth middleware (mocked req/res)', () => {
         expect(next).not.toHaveBeenCalled();
     });
 
+    it('passes the replay store through and answers 401 invalid_dpop_proof on a replayed proof', async () => {
+        mockVerifyAccessToken.mockResolvedValue({
+            token: boundToken,
+            clientId: 'client-123',
+            scopes: [],
+            expiresAt: Math.floor(Date.now() / 1000) + 3600,
+            cnf: { jkt: signer.jkt }
+        });
+        const seen = new Set<string>();
+        const replay = { consume: (key: string) => (seen.has(key) ? false : (seen.add(key), true)) };
+        const proof = await buildProof(signer, 'POST', 'https://mcp.example.com/mcp', boundToken);
+        const middleware = requireDpopAuth({ verifier: mockVerifier, replay });
+
+        const first = createMockReqResNext(`DPoP ${boundToken}`, proof);
+        await middleware(first.req, first.res, first.next);
+        expect(first.next).toHaveBeenCalled();
+
+        const second = createMockReqResNext(`DPoP ${boundToken}`, proof);
+        await middleware(second.req, second.res, second.next);
+        expect(second.res.status).toHaveBeenCalledWith(401);
+        expect(second.res.json).toHaveBeenCalledWith(expect.objectContaining({ error: 'invalid_dpop_proof' }));
+        expect(second.next).not.toHaveBeenCalled();
+    });
+
     it('responds 403 with scope in WWW-Authenticate when required scopes are missing', async () => {
         mockVerifyAccessToken.mockResolvedValue({
             token: boundToken,

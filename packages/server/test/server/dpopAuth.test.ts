@@ -233,6 +233,90 @@ describe('verifyDpopToken', () => {
     });
 });
 
+describe('verifyDpopToken jti replay protection', () => {
+    const token = 'bound-token';
+    let signer: Signer;
+    let consume: ReturnType<typeof vi.fn>;
+    let options: DpopAuthOptions;
+
+    beforeEach(async () => {
+        signer = await generateSigner();
+        const seen = new Set<string>();
+        consume = vi.fn((key: string) => {
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+        options = {
+            verifier: verifierFor({
+                [token]: {
+                    token,
+                    clientId: 'c',
+                    scopes: ['mcp'],
+                    expiresAt: Math.floor(Date.now() / 1000) + 3600,
+                    cnf: { jkt: signer.jkt }
+                }
+            }),
+            replay: { consume: consume as unknown as (key: string, ttlSeconds: number) => boolean }
+        };
+    });
+
+    const request = (proof: string) => ({ authorization: `DPoP ${token}`, dpop: proof, method: 'POST', url });
+
+    it('accepts a proof once and refuses the same proof again with invalid_dpop_proof', async () => {
+        const proof = await buildProof(signer, 'POST', url, token);
+        await expect(verifyDpopToken(request(proof), options)).resolves.toMatchObject({ token });
+        await expect(verifyDpopToken(request(proof), options)).rejects.toMatchObject({
+            code: OAuthErrorCode.InvalidDpopProof,
+            message: "DPoP proof 'jti' has already been used"
+        });
+        // A fresh proof from the same key is fine.
+        await expect(verifyDpopToken(request(await buildProof(signer, 'POST', url, token)), options)).resolves.toMatchObject({ token });
+    });
+
+    it('keys the store by "<jkt>.<jti>" with a TTL of twice the iat window', async () => {
+        const proof = await buildProof(signer, 'POST', url, token);
+        const jti = (JSON.parse(Buffer.from(proof.split('.')[1]!, 'base64url').toString()) as { jti: string }).jti;
+        await verifyDpopToken(request(proof), options);
+        expect(consume).toHaveBeenCalledWith(`${signer.jkt}.${jti}`, 600);
+
+        const proof2 = await buildProof(signer, 'POST', url, token);
+        await verifyDpopToken(request(proof2), { ...options, iatSkewSeconds: 30 });
+        expect(consume).toHaveBeenLastCalledWith(expect.stringMatching(new RegExp(`^${signer.jkt}\\.`)), 60);
+    });
+
+    it('rounds the TTL up to a whole second and never passes 0', async () => {
+        await verifyDpopToken(request(await buildProof(signer, 'POST', url, token)), { ...options, iatSkewSeconds: 2.25 });
+        expect(consume).toHaveBeenLastCalledWith(expect.any(String), 5);
+
+        await verifyDpopToken(request(await buildProof(signer, 'POST', url, token)), { ...options, iatSkewSeconds: 0 });
+        expect(consume).toHaveBeenLastCalledWith(expect.any(String), 1);
+    });
+
+    it('accepts an async store', async () => {
+        const replay = { consume: vi.fn(async () => false) };
+        const proof = await buildProof(signer, 'POST', url, token);
+        await expect(verifyDpopToken(request(proof), { ...options, replay })).rejects.toMatchObject({
+            code: OAuthErrorCode.InvalidDpopProof
+        });
+    });
+
+    it('does not consume the jti of a request refused by an earlier check', async () => {
+        const proof = await buildProof(signer, 'POST', url, token);
+        await expect(verifyDpopToken(request(proof), { ...options, requiredScopes: ['admin'] })).rejects.toMatchObject({
+            code: OAuthErrorCode.InsufficientScope
+        });
+        expect(consume).not.toHaveBeenCalled();
+    });
+
+    it('is off when the option is omitted', async () => {
+        const proof = await buildProof(signer, 'POST', url, token);
+        const { replay: _replay, ...withoutReplay } = options;
+        await verifyDpopToken(request(proof), withoutReplay);
+        await expect(verifyDpopToken(request(proof), withoutReplay)).resolves.toMatchObject({ token });
+    });
+});
+
 describe('verifyDpopToken with a JWT-shaped access token', () => {
     // The tests above all use short opaque strings as the access token, matching an
     // introspection-backed OAuthTokenVerifier. This proves the same flow when the access token is
@@ -382,6 +466,26 @@ describe('requireDpopAuth (web-standard)', () => {
         const result = await gate(new Request(url, { method: 'POST', headers: { Authorization: 'DPoP whatever' } }));
         expect(result).toBeInstanceOf(Response);
         expect((result as Response).status).toBe(401);
+    });
+
+    it('passes the replay store through and answers 401 invalid_dpop_proof on a replayed proof', async () => {
+        const signer = await generateSigner();
+        const token = 'tok-replay';
+        const seen = new Set<string>();
+        const gate = requireDpopAuth({
+            verifier: verifierFor({
+                [token]: { token, clientId: 'c', scopes: [], expiresAt: Math.floor(Date.now() / 1000) + 3600, cnf: { jkt: signer.jkt } }
+            }),
+            replay: { consume: (key: string) => !seen.has(key) && !!seen.add(key) }
+        });
+        const proof = await buildProof(signer, 'POST', url, token);
+        const first = await gate(new Request(url, { method: 'POST', headers: { Authorization: `DPoP ${token}`, DPoP: proof } }));
+        expect(first).toMatchObject({ token });
+
+        const second = await gate(new Request(url, { method: 'POST', headers: { Authorization: `DPoP ${token}`, DPoP: proof } }));
+        expect(second).toBeInstanceOf(Response);
+        expect((second as Response).status).toBe(401);
+        expect((second as Response).headers.get('WWW-Authenticate')).toContain('error="invalid_dpop_proof"');
     });
 
     it('throws at creation time for missing options', () => {

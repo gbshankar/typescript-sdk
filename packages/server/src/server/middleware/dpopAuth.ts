@@ -14,7 +14,7 @@ import { buildWwwAuthenticateHeader } from './authChallenge';
 import type { VerifyBearerTokenOptions } from './bearerAuth';
 import { assertExpectedResource } from './bearerAuth';
 import type { DpopNonceState } from './dpop';
-import { DPOP_SUPPORTED_ALGS, verifyDpopProof } from './dpop';
+import { DEFAULT_IAT_SKEW_SECONDS, DPOP_SUPPORTED_ALGS, verifyDpopProof } from './dpop';
 
 // Re-exported so a `requireDpopAuth` caller building `DpopAuthOptions` doesn't need a second
 // import from `./bearerAuth` for the token-verifier type it shares with Bearer auth.
@@ -45,9 +45,22 @@ export interface DpopAuthOptions extends VerifyBearerTokenOptions {
         issue(): string;
     } & DpopNonceState;
 
-    // TODO: there's no equivalent hook here for jti-replay tracking (see the TODO on the `jti`
-    // check in dpop.ts) — nonce gets a first-class option, jti-uniqueness doesn't yet. A caller
-    // who wants both has to bypass requireDpopAuth/verifyDpopToken and re-implement this gate.
+    /**
+     * `jti` replay protection (RFC 9449 §11.1 — a SHOULD). Omit to not track `jti` values. When
+     * set, {@linkcode verifyDpopToken} calls `consume()` once per otherwise-valid request, after
+     * every other check, with the key `"<jkt>.<jti>"` (proof key thumbprint and proof `jti`) and
+     * the number of whole seconds the proof could at most still pass the `iat` window (twice
+     * `iatSkewSeconds`, rounded up, at least 1). The store keeps the key for that long; `false`
+     * (seen before) refuses the request with `401 invalid_dpop_proof`. Storage and atomicity are
+     * the host's — an in-memory `Map`, Redis `SET NX EX`, etc.
+     */
+    replay?: {
+        /**
+         * Record `key` for `ttlSeconds` (a positive integer); return `false` if it was already
+         * recorded. May return a `Promise`; {@linkcode verifyDpopToken} always `await`s the result.
+         */
+        consume(key: string, ttlSeconds: number): boolean | Promise<boolean>;
+    };
 }
 
 /** A raw incoming request's fields relevant to DPoP validation, framework-neutral. */
@@ -75,14 +88,15 @@ export interface DpopRequest {
  * that the proof key's RFC 7638 thumbprint matches the verified token's `cnf.jkt` (RFC 9449 §4.3
  * step 12b — the actual sender-constraint check; everything upstream of it only confirms the
  * caller holds *some* valid token and *some* well-formed proof, not that they're bound together).
- * Then enforces `expectedResource`, `requiredScopes`, and token expiry exactly as `verifyBearerToken` does.
+ * Then enforces `expectedResource`, `requiredScopes`, and token expiry exactly as `verifyBearerToken` does,
+ * and consumes the proof's `jti` through `options.replay` when set.
  *
  * On any failure throws an {@linkcode OAuthError} — pass that to
  * {@linkcode dpopAuthChallengeResponse} for the matching HTTP answer, or use
  * {@linkcode requireDpopAuth} to get both steps as one call.
  */
 export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOptions): Promise<AuthInfo> {
-    const { verifier, requiredScopes = [], expectedResource, iatSkewSeconds, nonce } = options;
+    const { verifier, requiredScopes = [], expectedResource, iatSkewSeconds = DEFAULT_IAT_SKEW_SECONDS, nonce, replay } = options;
 
     if (!request.authorization) {
         throw new OAuthError(OAuthErrorCode.InvalidToken, 'Missing Authorization header');
@@ -97,7 +111,7 @@ export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOpt
     // Same audience check as verifyBearerToken. A DPoP endpoint must not skip it.
     assertExpectedResource(authInfo, expectedResource);
 
-    const { jkt } = await verifyDpopProof({
+    const { jkt, claims } = await verifyDpopProof({
         proof: request.dpop,
         method: request.method,
         url: request.url,
@@ -124,6 +138,11 @@ export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOpt
         throw new OAuthError(OAuthErrorCode.InvalidToken, 'Token has no expiration time');
     } else if (authInfo.expiresAt < Date.now() / 1000) {
         throw new OAuthError(OAuthErrorCode.InvalidToken, 'Token has expired');
+    }
+
+    // Last, so a refused request never consumes its jti. TTL = the iat window (2 * skew), whole seconds, at least 1.
+    if (replay && !(await replay.consume(`${jkt}.${claims.jti}`, Math.max(1, Math.ceil(2 * iatSkewSeconds))))) {
+        throw new OAuthError(OAuthErrorCode.InvalidDpopProof, "DPoP proof 'jti' has already been used");
     }
 
     return authInfo;
@@ -197,8 +216,8 @@ export function dpopAuthChallengeResponse(
 export function requireDpopAuth(options: DpopAuthOptions): (request: Request) => Promise<AuthInfo | Response> {
     // Destructure at creation so a plain-JS caller passing undefined or malformed options crashes
     // at startup, not on the first request.
-    const { verifier, requiredScopes = [], resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce } = options;
-    const resolved = { verifier, requiredScopes, resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce };
+    const { verifier, requiredScopes = [], resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce, replay } = options;
+    const resolved = { verifier, requiredScopes, resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce, replay };
     return async request => {
         // Outside the try: a wrong-framework misuse (no web-standard Request) should throw
         // loudly, not surface as a 500 challenge.
