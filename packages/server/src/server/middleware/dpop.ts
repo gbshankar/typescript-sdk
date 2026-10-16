@@ -21,6 +21,9 @@ import { OAuthError, OAuthErrorCode } from '@modelcontextprotocol/core-internal'
 /** Asymmetric JWS algorithms a DPoP proof may be signed with (RFC 9449 §11.6 forbids `none` and symmetric algs). */
 export const DPOP_SUPPORTED_ALGS = ['ES256', 'ES384', 'ES512', 'RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'EdDSA'] as const;
 
+/** @internal Default `iatSkewSeconds` (SEP-1932's recommended ±5 minutes). */
+export const DEFAULT_IAT_SKEW_SECONDS = 300;
+
 /** A DPoP JWS algorithm this SDK can verify proofs signed with. */
 export type DpopAlg = (typeof DPOP_SUPPORTED_ALGS)[number];
 
@@ -215,9 +218,11 @@ function normalizeHtu(raw: string): string {
 export interface DpopNonceState {
     /**
      * Whether `nonce` (the proof's `nonce` claim, or `undefined` if it carried none) is currently
-     * acceptable. Return `true` unconditionally to never require a nonce.
+     * acceptable. Return `true` unconditionally to never require a nonce. Return a `boolean`, or a
+     * `Promise<boolean>` for a store shared between server instances; {@linkcode verifyDpopProof}
+     * always `await`s the result, so both forms behave the same.
      */
-    verify(nonce: string | undefined): boolean;
+    verify(nonce: string | undefined): boolean | Promise<boolean>;
 }
 
 export interface VerifyDpopProofOptions {
@@ -273,7 +278,7 @@ export interface VerifiedDpopProof {
  * {@linkcode server/middleware/dpopAuth.verifyDpopToken | verifyDpopToken} for the composed version).
  */
 export async function verifyDpopProof(options: VerifyDpopProofOptions): Promise<VerifiedDpopProof> {
-    const { proof, method, url, accessToken, iatSkewSeconds = 300, nonce } = options;
+    const { proof, method, url, accessToken, iatSkewSeconds = DEFAULT_IAT_SKEW_SECONDS, nonce } = options;
 
     if (proof === undefined) {
         throw invalidProof('missing DPoP proof header');
@@ -314,11 +319,7 @@ export async function verifyDpopProof(options: VerifyDpopProofOptions): Promise<
     if (typeof payload.jti !== 'string' || payload.jti.length === 0) {
         throw invalidProof("DPoP proof is missing the 'jti' claim");
     }
-    // TODO: this only checks `jti` is present, not that it's unused — RFC 9449 §11.1 treats
-    // jti-replay tracking as a SHOULD, defense-in-depth measure, so a captured (proof, token) pair
-    // can be replayed for the rest of the `iatSkewSeconds` window. Left to the caller for now (the
-    // returned `claims.jti` is exactly for that); DpopAuthOptions.nonce has a first-class hook,
-    // jti-replay doesn't yet.
+    // Presence only: `jti` uniqueness (RFC 9449 §11.1) is the `replay` option of verifyDpopToken.
     if (typeof payload.htm !== 'string' || payload.htm.toUpperCase() !== method.toUpperCase()) {
         throw invalidProof("DPoP proof 'htm' does not match the request method");
     }
@@ -345,7 +346,7 @@ export async function verifyDpopProof(options: VerifyDpopProofOptions): Promise<
         }
     }
 
-    if (nonce && !nonce.verify(typeof payload.nonce === 'string' ? payload.nonce : undefined)) {
+    if (nonce && !(await nonce.verify(typeof payload.nonce === 'string' ? payload.nonce : undefined))) {
         throw new OAuthError(OAuthErrorCode.UseDpopNonce, 'a fresh server-provided nonce is required');
     }
 

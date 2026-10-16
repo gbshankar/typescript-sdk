@@ -14,7 +14,7 @@ import { buildWwwAuthenticateHeader } from './authChallenge';
 import type { VerifyBearerTokenOptions } from './bearerAuth';
 import { assertExpectedResource } from './bearerAuth';
 import type { DpopNonceState } from './dpop';
-import { DPOP_SUPPORTED_ALGS, verifyDpopProof } from './dpop';
+import { DEFAULT_IAT_SKEW_SECONDS, DPOP_SUPPORTED_ALGS, verifyDpopProof } from './dpop';
 
 // Re-exported so a `requireDpopAuth` caller building `DpopAuthOptions` doesn't need a second
 // import from `./bearerAuth` for the token-verifier type it shares with Bearer auth.
@@ -36,18 +36,38 @@ export interface DpopAuthOptions extends VerifyBearerTokenOptions {
 
     /**
      * Server-provided nonce support (RFC 9449 §9 — a SHOULD, not a MUST). Omit to never require
-     * a nonce. When set, {@linkcode dpopAuthChallengeResponse} calls `issue()` to mint the nonce
-     * returned in a `use_dpop_nonce` challenge's `DPoP-Nonce` header, and {@linkcode verifyDpopToken}
-     * calls `verify()` (via {@linkcode DpopNonceState}) to check a presented proof's nonce.
+     * a nonce. When set, {@linkcode dpopAuthChallengeResponse} calls `issue()` for the `DPoP-Nonce`
+     * header on every `401` (so a client's first, token-less request already learns the nonce), and
+     * {@linkcode verifyDpopToken} calls `verify()` (via {@linkcode DpopNonceState}) to check a
+     * presented proof's nonce. RFC 9449 §8.2 lets a fresh nonce ride on success responses too; the
+     * Express middleware sets it there itself, a `fetch` host sets `DPoP-Nonce: nonce.issue()` on its
+     * own response. When to rotate is the host's policy, expressed through what `issue()` returns.
      */
     nonce?: {
-        /** Mint the nonce to include in the next `use_dpop_nonce` challenge. */
+        /**
+         * The nonce to send in a `DPoP-Nonce` response header: the one the next proof should carry.
+         * Called on every `401`, so also for unauthenticated requests; return the current value and
+         * keep no per-call state, or an anonymous caller can make the server mint nonces at will.
+         */
         issue(): string;
     } & DpopNonceState;
 
-    // TODO: there's no equivalent hook here for jti-replay tracking (see the TODO on the `jti`
-    // check in dpop.ts) — nonce gets a first-class option, jti-uniqueness doesn't yet. A caller
-    // who wants both has to bypass requireDpopAuth/verifyDpopToken and re-implement this gate.
+    /**
+     * `jti` replay protection (RFC 9449 §11.1 — a SHOULD). Omit to not track `jti` values. When
+     * set, {@linkcode verifyDpopToken} calls `consume()` once per otherwise-valid request, after
+     * every other check, with the key `"<jkt>.<jti>"` (proof key thumbprint and proof `jti`) and
+     * the number of whole seconds the proof could at most still pass the `iat` window (twice
+     * `iatSkewSeconds`, rounded up, at least 1). The store keeps the key for that long; `false`
+     * (seen before) refuses the request with `401 invalid_dpop_proof`. Storage and atomicity are
+     * the host's — an in-memory `Map`, Redis `SET NX EX`, etc.
+     */
+    replay?: {
+        /**
+         * Record `key` for `ttlSeconds` (a positive integer); return `false` if it was already
+         * recorded. May return a `Promise`; {@linkcode verifyDpopToken} always `await`s the result.
+         */
+        consume(key: string, ttlSeconds: number): boolean | Promise<boolean>;
+    };
 }
 
 /** A raw incoming request's fields relevant to DPoP validation, framework-neutral. */
@@ -75,14 +95,16 @@ export interface DpopRequest {
  * that the proof key's RFC 7638 thumbprint matches the verified token's `cnf.jkt` (RFC 9449 §4.3
  * step 12b — the actual sender-constraint check; everything upstream of it only confirms the
  * caller holds *some* valid token and *some* well-formed proof, not that they're bound together).
- * Then enforces `expectedResource`, `requiredScopes`, and token expiry exactly as `verifyBearerToken` does.
+ * Then enforces `expectedResource`, `requiredScopes`, and token expiry exactly as `verifyBearerToken` does,
+ * consumes the proof's `jti` through `options.replay` when set, and stamps `resourceMetadataUrl` onto
+ * the returned {@linkcode AuthInfo} as `verifyBearerToken` does.
  *
  * On any failure throws an {@linkcode OAuthError} — pass that to
  * {@linkcode dpopAuthChallengeResponse} for the matching HTTP answer, or use
  * {@linkcode requireDpopAuth} to get both steps as one call.
  */
 export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOptions): Promise<AuthInfo> {
-    const { verifier, requiredScopes = [], expectedResource, iatSkewSeconds, nonce } = options;
+    const { verifier, requiredScopes = [], expectedResource, iatSkewSeconds = DEFAULT_IAT_SKEW_SECONDS, nonce, replay } = options;
 
     if (!request.authorization) {
         throw new OAuthError(OAuthErrorCode.InvalidToken, 'Missing Authorization header');
@@ -97,7 +119,7 @@ export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOpt
     // Same audience check as verifyBearerToken. A DPoP endpoint must not skip it.
     assertExpectedResource(authInfo, expectedResource);
 
-    const { jkt } = await verifyDpopProof({
+    const { jkt, claims } = await verifyDpopProof({
         proof: request.dpop,
         method: request.method,
         url: request.url,
@@ -126,6 +148,16 @@ export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOpt
         throw new OAuthError(OAuthErrorCode.InvalidToken, 'Token has expired');
     }
 
+    // Last, so a refused request never consumes its jti. TTL = the iat window (2 * skew), whole seconds, at least 1.
+    if (replay && !(await replay.consume(`${jkt}.${claims.jti}`, Math.max(1, Math.ceil(2 * iatSkewSeconds))))) {
+        throw new OAuthError(OAuthErrorCode.InvalidDpopProof, "DPoP proof 'jti' has already been used");
+    }
+
+    // Same hand-off as verifyBearerToken: a verifier-set value wins over the gate's configuration.
+    if (options.resourceMetadataUrl !== undefined && authInfo.resourceMetadataUrl === undefined) {
+        return { ...authInfo, resourceMetadataUrl: options.resourceMetadataUrl };
+    }
+
     return authInfo;
 }
 
@@ -135,9 +167,10 @@ export async function verifyDpopToken(request: DpopRequest, options: DpopAuthOpt
  * Maps an {@linkcode OAuthError} to its status — `401` for `invalid_token`/`invalid_dpop_proof`
  * and `use_dpop_nonce` (all carrying a `WWW-Authenticate: DPoP …` challenge advertising the
  * accepted `algs`, plus `resource_metadata` when configured), `403` for `insufficient_scope`,
- * `500` for `server_error`, `400` for anything else. `use_dpop_nonce` additionally carries a fresh
- * `DPoP-Nonce` response header (from `options.nonce.issue()`) for the client to retry with — see
- * RFC 9449 §9. A non-`OAuthError` value answers `500 server_error`. The body is the OAuth error JSON.
+ * `500` for `server_error`, `400` for anything else. When `options.nonce` is set, every `401` also
+ * carries a `DPoP-Nonce` response header (from `options.nonce.issue()`) for the client's next proof
+ * — see RFC 9449 §8.2 / §9. A non-`OAuthError` value answers `500 server_error`. The body is the
+ * OAuth error JSON.
  */
 export function dpopAuthChallengeResponse(
     error: unknown,
@@ -155,10 +188,9 @@ export function dpopAuthChallengeResponse(
 
     switch (error.code) {
         case OAuthErrorCode.InvalidToken:
-        case OAuthErrorCode.InvalidDpopProof: {
-            return Response.json(error.toResponseObject(), { status: 401, headers: { 'WWW-Authenticate': challenge() } });
-        }
+        case OAuthErrorCode.InvalidDpopProof:
         case OAuthErrorCode.UseDpopNonce: {
+            // Every 401 carries the nonce, not only use_dpop_nonce: the first request has no proof yet to carry one.
             const headers: Record<string, string> = { 'WWW-Authenticate': challenge() };
             if (nonce) headers['DPoP-Nonce'] = nonce.issue();
             return Response.json(error.toResponseObject(), { status: 401, headers });
@@ -183,6 +215,13 @@ export function dpopAuthChallengeResponse(
  * Hono. The returned gate resolves to the verified {@linkcode AuthInfo}, or to the ready-to-return
  * challenge `Response` when the request must be refused.
  *
+ * The proof's `htu` is compared with `request.url`. Behind a reverse proxy or TLS termination that
+ * is the internal URL, not the one the client signed, so pass `requestUrl`, a function that derives
+ * the external URL per request (for example from `Forwarded` headers you trust). It is a function,
+ * not a fixed string, so one gate behind several routes never checks every path against one URL.
+ * The Express middleware rebuilds the URL itself through Express's `trust proxy` setting instead
+ * (https://expressjs.com/en/guide/behind-proxies.html); see RFC 9449 §4.3 for what `htu` must match.
+ *
  * @example
  * ```ts source="./dpopAuth.examples.ts#requireDpopAuth_fetchGate"
  * const gate = requireDpopAuth({ verifier, requiredScopes: ['mcp'] });
@@ -194,11 +233,16 @@ export function dpopAuthChallengeResponse(
  * }
  * ```
  */
-export function requireDpopAuth(options: DpopAuthOptions): (request: Request) => Promise<AuthInfo | Response> {
+export function requireDpopAuth(
+    options: DpopAuthOptions & {
+        /** Derives the URL the proof's `htu` must match, when it is not `request.url`. @default request.url */
+        requestUrl?: (request: Request) => string;
+    }
+): (request: Request) => Promise<AuthInfo | Response> {
     // Destructure at creation so a plain-JS caller passing undefined or malformed options crashes
     // at startup, not on the first request.
-    const { verifier, requiredScopes = [], resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce } = options;
-    const resolved = { verifier, requiredScopes, resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce };
+    const { verifier, requiredScopes = [], resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce, replay, requestUrl } = options;
+    const resolved = { verifier, requiredScopes, resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce, replay };
     return async request => {
         // Outside the try: a wrong-framework misuse (no web-standard Request) should throw
         // loudly, not surface as a 500 challenge.
@@ -208,10 +252,9 @@ export function requireDpopAuth(options: DpopAuthOptions): (request: Request) =>
         // duplicate DPoP header this way; a single proof JWT never contains a comma.
         const dpop = request.headers.get('dpop') ?? undefined;
         try {
-            return await verifyDpopToken(
-                { authorization: authorization || undefined, dpop, method: request.method, url: request.url },
-                resolved
-            );
+            // Inside the try: a host's requestUrl function that throws answers 500 like a throwing verifier.
+            const url = requestUrl ? requestUrl(request) : request.url;
+            return await verifyDpopToken({ authorization: authorization || undefined, dpop, method: request.method, url }, resolved);
         } catch (error) {
             return dpopAuthChallengeResponse(error, resolved);
         }
