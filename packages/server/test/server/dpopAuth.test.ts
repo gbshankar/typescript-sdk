@@ -488,6 +488,56 @@ describe('requireDpopAuth (web-standard)', () => {
         expect((second as Response).headers.get('WWW-Authenticate')).toContain('error="invalid_dpop_proof"');
     });
 
+    describe('requestUrl', () => {
+        const internalUrl = 'http://10.0.0.7:8080/mcp';
+        const token = 'tok-1';
+        let signer: Signer;
+        let verifier: OAuthTokenVerifier;
+
+        beforeEach(async () => {
+            signer = await generateSigner();
+            verifier = verifierFor({
+                [token]: { token, clientId: 'c', scopes: [], expiresAt: Math.floor(Date.now() / 1000) + 3600, cnf: { jkt: signer.jkt } }
+            });
+        });
+
+        // The proof is signed for the external URL; the gate sees the request at the internal one.
+        const proxiedRequest = async (headers: Record<string, string> = {}) =>
+            new Request(internalUrl, {
+                method: 'POST',
+                headers: { Authorization: `DPoP ${token}`, DPoP: await buildProof(signer, 'POST', url, token), ...headers }
+            });
+
+        it('compares htu with request.url by default', async () => {
+            const result = await requireDpopAuth({ verifier })(await proxiedRequest());
+            expect(result).toBeInstanceOf(Response);
+            expect(await (result as Response).json()).toMatchObject({
+                error_description: "DPoP proof 'htu' does not match the request URI"
+            });
+        });
+
+        it('compares htu with the URL a requestUrl function derives from the request', async () => {
+            const requestUrl = (request: Request) =>
+                `${request.headers.get('x-forwarded-proto')}://${request.headers.get('x-forwarded-host')}${new URL(request.url).pathname}`;
+            const gate = requireDpopAuth({ verifier, requestUrl });
+            const forwarded = { 'X-Forwarded-Proto': 'https', 'X-Forwarded-Host': 'mcp.example.com' };
+            expect(await gate(await proxiedRequest(forwarded))).toMatchObject({ token });
+            expect(await gate(await proxiedRequest({ ...forwarded, 'X-Forwarded-Host': 'other.example.com' }))).toBeInstanceOf(Response);
+        });
+
+        it('answers 500 server_error when the requestUrl function throws', async () => {
+            const gate = requireDpopAuth({
+                verifier,
+                requestUrl: () => {
+                    throw new Error('no Forwarded header');
+                }
+            });
+            const result = (await gate(await proxiedRequest())) as Response;
+            expect(result.status).toBe(500);
+            expect(await result.json()).toMatchObject({ error: 'server_error' });
+        });
+    });
+
     it('throws at creation time for missing options', () => {
         expect(() => requireDpopAuth(undefined as never)).toThrow(TypeError);
     });

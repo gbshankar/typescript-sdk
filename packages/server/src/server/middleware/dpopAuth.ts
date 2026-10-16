@@ -202,6 +202,13 @@ export function dpopAuthChallengeResponse(
  * Hono. The returned gate resolves to the verified {@linkcode AuthInfo}, or to the ready-to-return
  * challenge `Response` when the request must be refused.
  *
+ * The proof's `htu` is compared with `request.url`. Behind a reverse proxy or TLS termination that
+ * is the internal URL, not the one the client signed, so pass `requestUrl`, a function that derives
+ * the external URL per request (for example from `Forwarded` headers you trust). It is a function,
+ * not a fixed string, so one gate behind several routes never checks every path against one URL.
+ * The Express middleware rebuilds the URL itself through Express's `trust proxy` setting instead
+ * (https://expressjs.com/en/guide/behind-proxies.html); see RFC 9449 §4.3 for what `htu` must match.
+ *
  * @example
  * ```ts source="./dpopAuth.examples.ts#requireDpopAuth_fetchGate"
  * const gate = requireDpopAuth({ verifier, requiredScopes: ['mcp'] });
@@ -213,10 +220,15 @@ export function dpopAuthChallengeResponse(
  * }
  * ```
  */
-export function requireDpopAuth(options: DpopAuthOptions): (request: Request) => Promise<AuthInfo | Response> {
+export function requireDpopAuth(
+    options: DpopAuthOptions & {
+        /** Derives the URL the proof's `htu` must match, when it is not `request.url`. @default request.url */
+        requestUrl?: (request: Request) => string;
+    }
+): (request: Request) => Promise<AuthInfo | Response> {
     // Destructure at creation so a plain-JS caller passing undefined or malformed options crashes
     // at startup, not on the first request.
-    const { verifier, requiredScopes = [], resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce, replay } = options;
+    const { verifier, requiredScopes = [], resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce, replay, requestUrl } = options;
     const resolved = { verifier, requiredScopes, resourceMetadataUrl, expectedResource, iatSkewSeconds, nonce, replay };
     return async request => {
         // Outside the try: a wrong-framework misuse (no web-standard Request) should throw
@@ -227,10 +239,9 @@ export function requireDpopAuth(options: DpopAuthOptions): (request: Request) =>
         // duplicate DPoP header this way; a single proof JWT never contains a comma.
         const dpop = request.headers.get('dpop') ?? undefined;
         try {
-            return await verifyDpopToken(
-                { authorization: authorization || undefined, dpop, method: request.method, url: request.url },
-                resolved
-            );
+            // Inside the try: a host's requestUrl function that throws answers 500 like a throwing verifier.
+            const url = requestUrl ? requestUrl(request) : request.url;
+            return await verifyDpopToken({ authorization: authorization || undefined, dpop, method: request.method, url }, resolved);
         } catch (error) {
             return dpopAuthChallengeResponse(error, resolved);
         }
